@@ -17,3 +17,12 @@ dependencies = [
     "streamlit>=1.56.0",
     "uvicorn>=0.44.0",
 ]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Flat-layout project: explicitly list Python modules to avoid
+# auto-discovery errors from non-code folders like data/ and outputs/.
+py-modules = ["agent", "api", "app", "data_loader", "main"]
