@@ -3,6 +3,9 @@ import json
 from typing import Annotated
 from typing_extensions import TypedDict
 import os
+import shutil
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -20,34 +23,111 @@ os.makedirs("outputs", exist_ok=True)
 print("Booting up Agent Environment...")
 dfs = load_dataframes()
 
-with open("schema.json", "r") as f:
-    db_schema = json.load(f)
+# Regenerate schema to ensure enriched columns are included
+from data_loader import generate_schema
+db_schema = generate_schema(dfs)
+with open("schema.json", "w") as f:
+    json.dump(db_schema, f, indent=4)
 
 # 2. Define the Execution Tool
 @tool
 def execute_pandas_code(code: str) -> str:
     """
     Executes Python pandas code to analyze the dataset.
-    You have access to a dictionary named 'dfs' containing the dataframes. 
+    You have access to a dictionary named 'dfs' containing the dataframes.
+    A compatibility alias named 'df' is also available and points to the same dictionary.
     You MUST assign your final numerical or string answer to a variable named 'result'.
+    WARNING: The 'code' parameter MUST be purely valid python syntax. DO NOT include markdown, explanations, or English text.
     """
     clean_code = code.replace("```python", "").replace("```", "").strip()
     print(f"\n[Agent is running code...]\n{clean_code}\n")
     
     try:
-        local_env = {"dfs": dfs, "pd": pd, "plt": plt}
+        # Reset plotting state per execution so old figures never leak into a new request.
+        plt.close("all")
+        pre_existing_figures = set(plt.get_fignums())
+
+        local_env = {
+            "dfs": dfs,
+            "df": dfs,
+            "pd": pd,
+            "plt": plt,
+            "get_table_schema": get_table_schema,
+            "os": os,
+        }
         exec(clean_code, {}, local_env)
         
         if 'result' in local_env:
             output = str(local_env['result'])
+
+            # If model saved a chart but left result as an Axes/object,
+            # honor explicit file_path variable when it points to an existing file.
+            if not output.startswith("Plot saved successfully at "):
+                explicit_path = local_env.get("file_path")
+                if isinstance(explicit_path, str) and os.path.exists(explicit_path):
+                    output = f"Plot saved successfully at {explicit_path}"
+
+            # Recovery path: if plotting code produced a figure but forgot to save,
+            # persist the latest figure to a known path for the frontend.
+            figure_numbers = [
+                fig_num for fig_num in plt.get_fignums() if fig_num not in pre_existing_figures
+            ]
+            if figure_numbers and not output.startswith("Plot saved successfully at "):
+                os.makedirs("outputs", exist_ok=True)
+                fallback_plot_path = os.path.join("outputs", "current_plot.png")
+                plt.figure(figure_numbers[-1]).savefig(fallback_plot_path, bbox_inches="tight")
+                output = f"Plot saved successfully at {fallback_plot_path}"
+
+            # If model saved a plot outside outputs/, move it so the UI can always render it.
+            if output.startswith("Plot saved successfully at "):
+                raw_path = output.replace("Plot saved successfully at ", "", 1).strip()
+                normalized_path = raw_path.strip('"\'')
+
+                if normalized_path and not normalized_path.startswith("outputs") and os.path.exists(normalized_path):
+                    os.makedirs("outputs", exist_ok=True)
+                    destination_path = os.path.join("outputs", os.path.basename(normalized_path))
+                    shutil.move(normalized_path, destination_path)
+                    output = f"Plot saved successfully at {destination_path}"
+                elif normalized_path and normalized_path.startswith("outputs") and not os.path.exists(normalized_path):
+                    # Some model generations report outputs/... but save in cwd; recover by basename.
+                    fallback_source = os.path.basename(normalized_path)
+                    if os.path.exists(fallback_source):
+                        os.makedirs("outputs", exist_ok=True)
+                        destination_path = os.path.join("outputs", os.path.basename(fallback_source))
+                        shutil.move(fallback_source, destination_path)
+                        output = f"Plot saved successfully at {destination_path}"
+
             print(f"[Tool Output]: {output}")
+            plt.close("all")
             return output
         else:
+            plt.close("all")
             return "Execution Error: You forgot to assign the final answer to the 'result' variable."
+    except KeyError as e:
+        plt.close("all")
+        col_name = str(e).strip("'\"[]")
+        # Provide helpful hints for common column name errors
+        if 'product_category' in col_name.lower():
+            hint = " HINT: For product categories in order_items, use 'product_category_name_english' column."
+            return f"Column Error: {str(e)}.{hint}"
+        else:
+            return f"Column Error: {str(e)}"
     except Exception as e:
+        plt.close("all")
         error_msg = f"Python Error: {type(e).__name__}: {str(e)}"
         print(f"[{error_msg}]")
         return error_msg
+
+@tool
+def get_table_schema(table_name: str) -> str:
+    """
+    Returns the columns, data types, and sample data for a given table.
+    Use this tool to understand the structure of a table before querying it.
+    """
+    if table_name in db_schema:
+        return json.dumps(db_schema[table_name], indent=2)
+    else:
+        return f"Error: Table '{table_name}' not found. Available tables: {list(db_schema.keys())}"
 
 # --- LANGGRAPH SETUP ---
 
@@ -57,28 +137,34 @@ class State(TypedDict):
 
 # 4. Initialize Local LLM & Bind Tools
 llm = ChatOllama(model="llama3.1", temperature=0)
-tools = [execute_pandas_code]
+tools = [execute_pandas_code, get_table_schema]
 llm_with_tools = llm.bind_tools(tools)
 
 # 5. Define the Agent Node
 def chatbot(state: State):
     """The main reasoning engine."""
+    table_names = list(db_schema.keys())
     sys_msg = SystemMessage(content=f"""You are an autonomous Senior Data Analyst.
 A dictionary of pandas DataFrames named `dfs` is already loaded in memory.
+The available tables (DataFrames) are: {table_names}
 
-Here is the database schema:
-{json.dumps(db_schema, indent=2)}
+IMPORTANT TABLE ENRICHMENT:
+- The 'order_items' table has been enriched with English product categories
+- Use column 'product_category_name_english' for product category analysis
+- Avoid 'product_category_name_translation' or 'product_category' - these don't exist
 
-CRITICAL TOOL RULES:
-1. You have a native tool called `execute_pandas_code`. Use the system's tool-calling API to trigger it.
-2. NEVER type `execute_pandas_code(...)` in your text response. 
-3. The code you send to the tool MUST assign the final answer to a variable named `result`.
+WORKFLOW:
+1. For unknown column names: Call get_table_schema('table_name') first
+2. Write Python code to analyze data using execute_pandas_code tool
+3. Always assign final result to a 'result' variable before returning
+4. For plots: save to outputs/ directory and include [PLOT_GENERATED: path] in response
+5. Return plain English text, not code or JSON
 
-VISUALIZATIONS:
-4. If the user asks for a plot or chart, use `matplotlib.pyplot` (imported as `plt`).
-5. Save the figure exactly like this: `plt.savefig('outputs/current_plot.png', bbox_inches='tight')`. Do not use plt.show().
-6. If you save a plot, your python code MUST also include: `result = "Plot saved successfully"`.
-7. When the tool returns success, your final text response to the user MUST include the exact phrase: [PLOT_GENERATED].
+Code Guidelines:
+- Pure Python only, no markdown or comments
+- For plots: plt.savefig("outputs/filename.png", bbox_inches='tight'); result = "Plot saved to..."
+- Only generate plots when user explicitly asks for visualization
+- For text responses: Keep answer concise and in plain English
 """)
     # Prepend the system prompt to the conversation history
     messages = [sys_msg] + state["messages"]
